@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- No android:background here (ADR-0100 §1, layer 3): a View drawable would cover the native
+         surface even with a transparent page. MainActivity.applyWebViewBackground sets the base
+         colour (#050505, transparent while the native player shows); the window background is the
+         same #050505, so the first frame is not white. -->
+    <WebView
+        android:id="@+id/web_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:focusable="true"
+        android:focusableInTouchMode="true" />
+
+    <LinearLayout
+        android:id="@+id/error_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/vistaks_bg"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/error_message"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/error_message"
+            android:textColor="@color/vistaks_text"
+            android:textSize="28sp" />
+
+        <TextView
+            android:id="@+id/error_hint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/error_hint"
+            android:textColor="@color/vistaks_text_dim"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/retry_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:background="@drawable/retry_button_bg"
+            android:focusable="true"
+            android:minWidth="160dp"
+            android:paddingStart="32dp"
+            android:paddingTop="12dp"
+            android:paddingEnd="32dp"
+            android:paddingBottom="12dp"
+            android:stateListAnimator="@null"
+            android:text="@string/retry"
+            android:textColor="@color/retry_button_text"
+            android:textSize="20sp" />
+    </LinearLayout>
+</FrameLayout>

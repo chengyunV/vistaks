@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ADR-0100 §1: the native player's views, inserted in code by NativePlayerHost.attach (sideload
+     only; activity_main.xml in src/main stays as it is). -->
+<resources>
+    <item name="native_surface" type="id" />
+    <item name="native_subtitles" type="id" />
+</resources>

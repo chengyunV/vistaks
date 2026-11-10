@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Full-screen, no action bar, dark: the web page draws everything. -->
+    <style name="Theme.VistaksTv" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/vistaks_bg</item>
+        <item name="android:colorBackground">@color/vistaks_bg</item>
+        <item name="android:colorAccent">@color/vistaks_accent</item>
+        <item name="android:colorPrimary">@color/vistaks_bg</item>
+        <item name="android:colorPrimaryDark">@color/vistaks_bg</item>
+        <item name="android:statusBarColor">@color/vistaks_bg</item>
+        <item name="android:navigationBarColor">@color/vistaks_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>

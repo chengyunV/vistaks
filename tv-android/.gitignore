@@ -1,0 +1,12 @@
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+.kotlin/
+captures/
+
+# Play upload key: never commit (see README, 上架 Play 內部測試)
+keystore.properties
+*.jks
+*.keystore

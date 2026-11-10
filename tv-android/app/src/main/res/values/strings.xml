@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">Vistaks</string>
+    <string name="error_message">無法連線到 Vistaks</string>
+    <string name="error_hint">請確認網路連線後再試一次</string>
+    <string name="retry">重試</string>
+    <string name="render_loop_message">Vistaks 一再意外關閉</string>
+    <string name="render_loop_hint">按「重試」從首頁重新開始</string>
+</resources>

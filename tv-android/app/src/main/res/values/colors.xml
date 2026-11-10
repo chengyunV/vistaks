@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="vistaks_bg">#FF050505</color>
+    <color name="vistaks_surface">#FF1A1A1F</color>
+    <color name="vistaks_accent">#FFB18CFF</color>
+    <color name="vistaks_text">#FFF2F2F5</color>
+    <color name="vistaks_text_dim">#FF9A9AA5</color>
+    <color name="vistaks_on_accent">#FF050505</color>
+</resources>
