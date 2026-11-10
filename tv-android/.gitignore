@@ -10,3 +10,6 @@ captures/
 keystore.properties
 *.jks
 *.keystore
+
+# Self-update manifest URL of the publisher's own channel: never commit (see README, 自動更新)
+update.properties

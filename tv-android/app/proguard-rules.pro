@@ -3,6 +3,10 @@
     @android.webkit.JavascriptInterface <methods>;
 }
 -keepattributes JavascriptInterface
+# The self-update's bridge (window.VistaksTvUpdate; sideload flavor only, inert in play).
+-keepclassmembers class com.vistaks.tv.update.SelfUpdateHost$Bridge {
+    @android.webkit.JavascriptInterface <methods>;
+}
 
 # --- sideload flavor: native player (ADR-0100) -------------------------------------------------
 # Rules for NewPipeExtractor (its README) and Rhino / Rhino Engine, the JS engine that runs

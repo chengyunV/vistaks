@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Self-update (sideload flavor only): the app hands a newer APK of itself, signed with the
+         same key, to PackageInstaller; the system still asks the viewer to confirm. The play
+         flavor never declares this (Play updates the app itself). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+</manifest>

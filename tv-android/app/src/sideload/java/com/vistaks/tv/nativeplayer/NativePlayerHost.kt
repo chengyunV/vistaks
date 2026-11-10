@@ -1,6 +1,7 @@
 package com.vistaks.tv.nativeplayer
 
 import android.app.Activity
+import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -10,6 +11,8 @@ import android.util.Log
 import com.vistaks.tv.BuildConfig
 import android.view.Display
 import android.view.Gravity
+import android.view.Surface
+import android.view.SurfaceControl
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -28,6 +31,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.ByteArrayDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
@@ -90,8 +94,12 @@ import java.util.concurrent.TimeUnit
  * fill its output queue before the audio clock starts. Every drop burst in the first
  * [STARTUP_WINDOW_MS] is logged with its offset from the start, so the effect can be measured
  * on the device (`prerollMs` in nativeLoad overrides the default, 0 turns it off). A resume after
- * a pause (S2 measured 2-3 drops each) waits [RESUME_PREROLL_MS] with the source ready before the
- * clock runs again (`resumePrerollMs` overrides, 0 turns it off); its drops are logged the same way.
+ * a pause dropped 7-11 frames at 60p because the audio clock jumped ahead on resume (HDMI
+ * latency): [ResumeClockRenderersFactory] keeps that clock continuous (ResumeClock.kt). The HDMI
+ * path also drops sound it had been given while paused, so a pause of 2 s or more repositions the
+ * player where it is (still paused; ResumePlan.kt) and the resume is a fresh start whose picture
+ * waits for its sound. The resume pre-roll ([RESUME_PREROLL_MS], now 0; `resumePrerollMs` sets
+ * one) stays for measurements; resume drops are logged like start-up ones.
  *
  * Commands that arrive while a video is still resolving (or before the first player exists) are
  * kept, not dropped: the last rate, mute, volume, seek and captions apply when the source is
@@ -158,19 +166,34 @@ class NativePlayerHost(
     /** "videoId|languageCode|kind" of a caption fetch in flight (one at a time). */
     private var captionFetching: String? = null
 
-    /** A resume after a pause waits this long with the source ready (S2: 2-3 drops per resume). */
+    /** A resume after a pause waits this long with the source ready (`resumePrerollMs`; default 0). */
     private var resumePrerollMs = RESUME_PREROLL_MS
     /** Debug-only (`noAudio` in nativeLoad): play without the audio track — the standalone media
         clock runs the video. S4 device run (2026-11-10, SHIELD, 60p): every resume after a pause
         dropped 7-11 frames (~150 ms) with audio; 0 without it. The drops are the audio clock's
         jump on resume (HDMI output latency), not the decoder's: a 150 ms resume pre-roll, a
-        re-seek to the paused position and tunneled playback (below) changed nothing. Open. */
+        re-seek to the paused position and tunneled playback (below) changed nothing. See
+        ResumeClock.kt for the fix. */
     private var noAudio = false
     /** Debug-only (`tunneling` in nativeLoad): Android TV tunneled playback. Measured on the
         SHIELD: the same 8-14 drops per resume (whether the selector granted tunneling is unknown). */
     private var tunneling = false
+    /** The continuous audio clock across pause→play (ResumeClock.kt): on; a debug build's nativeLoad
+        may turn it off (`resumeClock: false`) to compare. SHIELD 2026-11-10, 60p: 7-11 drops per
+        resume without it, 0 with it. Read by the audio sink on the playback thread. */
+    @Volatile private var resumeClock = true
     private var resumePending = false
     private var resumeStartedAt = 0L
+
+    /** How a resume after a pause starts (ResumePlan.kt); a debug build's nativeLoad may pick another. */
+    @Volatile private var resumeConfig = ResumeConfig.DEFAULT
+    private var reposition = Reposition.NONE
+    private var repositionStartedAt = 0L
+    private var repositionReadyAt = 0L
+    private var repositionSawBuffering = false
+    /** The page said play while the reposition ran: it plays when that is done. */
+    private var playAfterReposition = false
+    private var pausedAt = 0L
 
     /** When the hand-over hold runs out (elapsedRealtime); a state() read may stretch it once. */
     private var handoverDeadline = 0L
@@ -197,6 +220,39 @@ class NativePlayerHost(
     private var pageRect: CssRect? = null
     private var videoWidth = 0
     private var videoHeight = 0
+    /** The decoder's picture in buffer pixels (videoWidth / videoHeight carry the pixel aspect). */
+    private var bufferWidth = 0
+    private var bufferHeight = 0
+
+    /**
+     * The picture's own layer (API 29+): a child SurfaceControl of the SurfaceView, placed with an
+     * integer source crop and destination ([VideoGeometry]) instead of the SurfaceView's own
+     * scale-and-clip (the edge noise, docs/adr/0100 "影像邊緣雜訊"). Debug builds may turn it off
+     * (`videoLayer: false` in nativeLoad) to compare.
+     */
+    private var videoLayerWanted = Build.VERSION.SDK_INT >= 29
+    private var videoLayer: SurfaceControl? = null
+    private var videoLayerSurface: Surface? = null
+    private var lastPlacement: VideoGeometry.Placement? = null
+    /** The decoder's own crop starts past 0 on that side (padding before the picture there too). */
+    private var decoderPaddedLeft = false
+    private var decoderPaddedTop = false
+    private var lastOutputFormat = ""
+    /** Debug builds: `edgeInset` in nativeLoad fixes the crop's inset (A/B on the TV); null = computed. */
+    private var edgeInsetOverride: Int? = null
+    /**
+     * GPU composition of the picture's layer (docs/adr/0100 "影像邊緣雜訊"): the SHIELD's hardware
+     * composer draws noise on the right and bottom edges when it scales a crop that does not start at
+     * the buffer's top-left corner (VideoGeometry.needsGpu); on such a composer (ComposerQuirks) those
+     * placements go to the GPU. [gpuForce] (debug nativeLoad `gpuCompose: "on" | "off"`) overrides
+     * it for an A/B; [layerGpu] is what the layer has now; [gpuUnavailable]: the GPU request failed
+     * once, and such placements are contained instead (bars, never the noise).
+     */
+    private val tegraComposer = ComposerQuirks.tegraComposer(Build.HARDWARE ?: "", Build.BOARD ?: "", systemProperty("ro.board.platform"))
+    private var gpuForce: Boolean? = null
+    private var gpuRadius = GPU_CORNER_RADIUS
+    private var layerGpu = false
+    private var gpuUnavailable = false
 
     /** Prepared paused; the first frame is up; playback starts [PREROLL_MS] later (start-up drops). */
     private var prerollPending = false
@@ -338,8 +394,33 @@ class NativePlayerHost(
         resumePending = false
         val p = player ?: return@Runnable
         Log.i(TAG, "${request?.videoId}: resume pre-roll over, playing (${countersText(p)})")
-        resumeStartedAt = SystemClock.elapsedRealtime()
-        startPlayback(p)
+        resume(p)
+    }
+    private val repositionTimer = Runnable { startReposition("paused ${SystemClock.elapsedRealtime() - pausedAt} ms") }
+    private val repositionTimeout = Runnable {
+        if (reposition != Reposition.IN_FLIGHT) return@Runnable
+        Log.w(TAG, "${request?.videoId}: reposition not done within $REPOSITION_TIMEOUT_MS ms; going on")
+        repositionDone("timeout")
+    }
+    /** Debug: when the picture moves after a resume (the first frame rendered after play). */
+    private var watchRenderedFrom = -1
+    private var watchSince = 0L
+    private var watchFromPositionMs = 0L
+    private val pictureWatch = object : Runnable {
+        override fun run() {
+            val p = player ?: return
+            val c = p.videoDecoderCounters ?: return
+            c.ensureUpdated()
+            val waited = SystemClock.elapsedRealtime() - watchSince
+            if (c.renderedOutputBufferCount > watchRenderedFrom) {
+                Log.i(TAG, "${request?.videoId}: resume: picture moved $waited ms after play (position ${p.currentPosition} ms, paused at ${watchFromPositionMs} ms)")
+                watchRenderedFrom = -1
+            } else if (waited < 3_000 && p.playWhenReady) {
+                main.postDelayed(this, 4)
+            } else {
+                watchRenderedFrom = -1
+            }
+        }
     }
     private val prerollEnd = Runnable {
         if (!prerollPending) return@Runnable
@@ -409,6 +490,7 @@ class NativePlayerHost(
 
     fun attach(root: FrameLayout) {
         this.root = root
+        Log.i(TAG, "composer: hardware=${Build.HARDWARE} board=${Build.BOARD} platform=${systemProperty("ro.board.platform")} -> ${if (tegraComposer) "Tegra: a scaled crop with a left or top offset is composed on the GPU" else "overlay for every placement"}")
         val view = SurfaceView(activity).apply {
             id = R.id.native_surface
             visibility = View.GONE
@@ -426,9 +508,15 @@ class NativePlayerHost(
         )
         // S3 on API 31+: the Surface's frame rate needs a valid Surface; it may come after play().
         view.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) = displayModes.onSurface(holder.surface)
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                displayModes.onSurface(holder.surface)
+                createVideoLayer()
+            }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-            override fun surfaceDestroyed(holder: SurfaceHolder) = displayModes.onSurface(null)
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                displayModes.onSurface(null)
+                releaseVideoLayer()
+            }
         })
         // S4: captions right above the picture (index 1), under the WebView: a plain View drawn into
         // the window, so the transparent page lets it through. Laid out with the surface.
@@ -465,6 +553,13 @@ class NativePlayerHost(
         val resumePreroll = extra?.optLong("resumePrerollMs", RESUME_PREROLL_MS)?.coerceIn(0, 1_000) ?: RESUME_PREROLL_MS
         val withoutAudio = BuildConfig.DEBUG && extra?.optBoolean("noAudio", false) == true
         val tunneled = BuildConfig.DEBUG && extra?.optBoolean("tunneling", false) == true
+        val layerWanted = Build.VERSION.SDK_INT >= 29 && (!BuildConfig.DEBUG || extra?.optBoolean("videoLayer", true) != false)
+        val clockGuard = !BuildConfig.DEBUG || extra?.optBoolean("resumeClock", true) != false
+        // Debug A/B for the edge noise: a fixed inset (0, 2, ...) instead of VideoGeometry.EDGE_INSET.
+        val insetOverride = if (BuildConfig.DEBUG && extra?.has("edgeInset") == true) extra.optInt("edgeInset", -1).takeIf { it >= 0 } else null
+        val force = if (BuildConfig.DEBUG) when (extra?.optString("gpuCompose", "")) { "on" -> true; "off" -> false; else -> null } else null
+        val radius = if (BuildConfig.DEBUG && extra?.has("gpuRadius") == true) extra.optDouble("gpuRadius", GPU_CORNER_RADIUS.toDouble()).toFloat() else GPU_CORNER_RADIUS
+        val resumePlan = ResumeConfig.parse(extra, BuildConfig.DEBUG)
         runOnMain {
             if (parsed == null) {
                 // Nothing playable asked for: never leave the page waiting on a picture that will not come.
@@ -474,6 +569,26 @@ class NativePlayerHost(
                 resumePrerollMs = resumePreroll
                 noAudio = withoutAudio
                 tunneling = tunneled
+                if (layerWanted != videoLayerWanted) {
+                    // The next player attaches to the other path (a debug comparison).
+                    videoLayerWanted = layerWanted
+                    if (!layerWanted) releaseVideoLayer() else createVideoLayer()
+                }
+                resumeClock = clockGuard
+                if (insetOverride != edgeInsetOverride) {
+                    edgeInsetOverride = insetOverride
+                    lastPlacement = null
+                }
+                if (force != gpuForce || radius != gpuRadius) {
+                    gpuForce = force
+                    gpuRadius = radius
+                    // Applied again at the next placement (a radius change too).
+                    lastPlacement = null
+                    if (layerGpu) videoLayer?.let { layer -> SurfaceControl.Transaction().also { setLayerGpu(it, layer, false) }.apply(); layerGpu = false }
+                    Log.i(TAG, "debug gpuCompose=${force ?: "auto"} radius=$radius")
+                }
+                resumeConfig = resumePlan.copy(resumePrerollMs = resumePreroll)
+                Log.i(TAG, "${parsed.videoId}: resume plan $resumeConfig, guard ${if (clockGuard) "on" else "off"}")
                 startLoad(parsed, preroll)
             }
         }
@@ -556,8 +671,20 @@ class NativePlayerHost(
         main.removeCallbacks(prerollEnd)
         resumePending = false
         main.removeCallbacks(resumeEnd)
+        playAfterReposition = false
         cancelModeWait("webview rebuilt")
-        player?.pause()
+        // The hold is a pause like the page's: it begins now when something played, and a long
+        // one repositions while paused (ResumePlan.kt), so the take-over's resume is measured from it.
+        val holding = player
+        val wasPlaying = holding?.playWhenReady == true
+        holding?.pause()
+        if (holding != null) {
+            pausedAt = ResumePlanner.pauseStart(wasPlaying, pausedAt, SystemClock.elapsedRealtime())
+            if (wasPlaying && reposition == Reposition.NONE) {
+                main.removeCallbacks(repositionTimer)
+                ResumePlanner.repositionDelay(resumeConfig, desiredRate)?.let { main.postDelayed(repositionTimer, it) }
+            }
+        }
         main.removeCallbacks(handoverTimeout)
         val held = request
         heldForHandover = held != null
@@ -663,6 +790,7 @@ class NativePlayerHost(
         prerollPending = false
         resumePending = false
         main.removeCallbacks(resumeEnd)
+        cancelReposition()
         lastState = STATE_UNSTARTED
         // The load sets the start; commands that follow it (even mid-extraction) override.
         muted = next.muted
@@ -790,6 +918,8 @@ class NativePlayerHost(
         val p = ensurePlayer()
         videoWidth = result.video.width
         videoHeight = result.video.height
+        bufferWidth = result.video.width
+        bufferHeight = result.video.height
         layoutSurface("source ready")
         if (view.visibility != View.VISIBLE) view.visibility = View.VISIBLE
         applyOverlay(true)
@@ -804,7 +934,7 @@ class NativePlayerHost(
             displayModes.switchPending
         }
         if (switchLanding) beginModeWait(result.videoId)
-        p.setVideoSurfaceView(view)
+        attachVideoOutput(p, view)
         // A seek the page sent while this was resolving wins over the load's position.
         val startMs = pendingSeekMs ?: positionMs
         pendingSeekMs = null
@@ -900,6 +1030,7 @@ class NativePlayerHost(
                 val position = p.currentPosition.coerceAtLeast(0)
                 Log.i(TAG, "${result.videoId}: source swapped at ${position} ms to carry captions ${wanted.languageCode}")
                 attachedCaption = wanted
+                cancelReposition()
                 p.setMediaSource(source, position)
                 p.prepare()
                 applyCaptions()
@@ -912,11 +1043,28 @@ class NativePlayerHost(
         player?.let { return it }
         val meter = DefaultBandwidthMeter.Builder(activity).build()
         bandwidthMeter = meter
-        val renderers = DefaultRenderersFactory(activity)
-            .setMediaCodecSelector(HARDWARE_FIRST)
-            .setEnableDecoderFallback(true)
+        val renderers = ResumeClockRenderersFactory(
+            activity,
+            policy = { ResumeClock.Policy(enabled = resumeClock, freshGuard = resumeConfig.freshGuard) },
+            onVideoOutputFormat = { format -> onDecoderOutputFormat(format) },
+        )
+        renderers.setMediaCodecSelector(HARDWARE_FIRST).setEnableDecoderFallback(true)
         val created = ExoPlayer.Builder(activity, renderers)
             .setBandwidthMeter(meter)
+            // Keeps 2 s behind the playing position (from the keyframe before it): a reposition (a
+            // seek 1 ms back from where it is, ResumePlan.kt) lands inside the buffer for the video
+            // and the audio alike. With 0 the audio sample before P was sometimes gone, the audio
+            // alone had to reload while the video held the whole byte budget, and the player
+            // failed with "stuck buffering and not loading" (SHIELD soak, 2026-11-10).
+            .setLoadControl(
+                DefaultLoadControl.Builder()
+                    .setBackBuffer(BACK_BUFFER_MS, true)
+                    // 30 s ahead (Media3: 50 s): at 4K60 (~25 Mbps) that stays under the ~131 MB video
+                    // byte target, so a stream that must reload is never starved by the bytes the
+                    // others hold.
+                    .setBufferDurationsMs(FORWARD_BUFFER_MS, FORWARD_BUFFER_MS, DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS, DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS)
+                    .build(),
+            )
             .setLooper(Looper.getMainLooper())
             .setHandleAudioBecomingNoisy(false)
             .build()
@@ -932,6 +1080,93 @@ class NativePlayerHost(
     private fun startPlayback(p: ExoPlayer) {
         playStartedAt = SystemClock.elapsedRealtime()
         p.playWhenReady = true
+    }
+
+    /** A resume's clock starts (the guard takes it from there: ResumeClock.kt). */
+    private fun resume(p: ExoPlayer) {
+        reposition = Reposition.NONE
+        resumeStartedAt = SystemClock.elapsedRealtime()
+        startPlayback(p)
+        if (BuildConfig.DEBUG) {
+            val c = p.videoDecoderCounters
+            if (c != null) {
+                c.ensureUpdated()
+                watchRenderedFrom = c.renderedOutputBufferCount
+                watchFromPositionMs = p.currentPosition
+                watchSince = resumeStartedAt
+                main.removeCallbacks(pictureWatch)
+                main.post(pictureWatch)
+                // The window SurfaceFlinger's frame timeline is compared with (System.nanoTime = SF's clock).
+                Log.i(TAG, "${request?.videoId}: resume window start ns=${System.nanoTime()} ${countersText(p)}")
+                main.removeCallbacks(windowEnd)
+                main.postDelayed(windowEnd, RESUME_WINDOW_MS + 2_000)
+            }
+        }
+    }
+
+    private val windowEnd = Runnable {
+        val p = player ?: return@Runnable
+        Log.i(TAG, "${request?.videoId}: resume window end ns=${System.nanoTime()} ${countersText(p)}")
+    }
+
+    private fun applyResume(p: ExoPlayer, action: ResumeAction, why: String) {
+        Log.i(TAG, "${request?.videoId}: resume ($why): $action")
+        when (action) {
+            ResumeAction.PlayNow -> resume(p)
+            is ResumeAction.Preroll -> {
+                resumePending = true
+                main.postDelayed(resumeEnd, action.ms)
+            }
+            ResumeAction.WaitForReposition -> {
+                playAfterReposition = true
+                syncPlayState()
+            }
+        }
+    }
+
+    /**
+     * Paused for [ResumeConfig.repositionAfterMs]: restart the audio output (and the decoders) at
+     * the paused position, still paused (ResumePlan.kt). The page keeps hearing "paused"; the
+     * position does not move and the surface keeps showing the same picture.
+     */
+    private fun startReposition(why: String) {
+        main.removeCallbacks(repositionTimer)
+        val p = player ?: return
+        if (resumeConfig.mode == ResumeMode.SLEW || reposition != Reposition.NONE) return
+        if (!firstFrame || resolving || p.playWhenReady || p.playbackState != Player.STATE_READY) return
+        reposition = Reposition.IN_FLIGHT
+        repositionStartedAt = SystemClock.elapsedRealtime()
+        repositionSawBuffering = false
+        val at = p.currentPosition.coerceAtLeast(0)
+        Log.i(TAG, "${request?.videoId}: reposition (${resumeConfig.mode}) at $at ms ($why; ${countersText(p)})")
+        main.removeCallbacks(repositionTimeout)
+        main.postDelayed(repositionTimeout, REPOSITION_TIMEOUT_MS)
+        // 1 ms back: Media3 treats a seek to the same millisecond as a no-op (nothing flushed).
+        p.seekTo((at - 1).coerceAtLeast(0))
+    }
+
+    private fun repositionDone(how: String) {
+        if (reposition != Reposition.IN_FLIGHT) return
+        main.removeCallbacks(repositionTimeout)
+        reposition = Reposition.DONE
+        repositionReadyAt = SystemClock.elapsedRealtime()
+        val p = player
+        Log.i(TAG, "${request?.videoId}: reposition done in ${repositionReadyAt - repositionStartedAt} ms ($how; position ${p?.currentPosition} ms${if (p != null) ", ${countersText(p)}" else ""})")
+        if (playAfterReposition && p != null) {
+            playAfterReposition = false
+            applyResume(p, ResumeAction.PlayNow, "after the reposition")
+        } else {
+            syncPlayState()
+        }
+    }
+
+    /** A seek, a load, a release, a source swap: whatever reposition there was goes with it. */
+    private fun cancelReposition() {
+        main.removeCallbacks(repositionTimer)
+        main.removeCallbacks(repositionTimeout)
+        main.removeCallbacks(pictureWatch)
+        reposition = Reposition.NONE
+        playAfterReposition = false
     }
 
     private fun applyCommand(cmd: String, value: Double, flag: Boolean?, language: String? = null) {
@@ -1009,7 +1244,7 @@ class NativePlayerHost(
             "play" -> {
                 prerollPending = false
                 main.removeCallbacks(prerollEnd)
-                if (resumePending) return
+                if (resumePending || playAfterReposition) return
                 if (modeWait && !p.playWhenReady) {
                     // A refresh-rate switch is still landing: endModeWait starts it.
                     modeHeldStart = true
@@ -1017,16 +1252,15 @@ class NativePlayerHost(
                     syncPlayState()
                     return
                 }
-                val resuming = firstFrame && !p.playWhenReady && p.playbackState == Player.STATE_READY
-                if (resuming && resumePrerollMs > 0) {
-                    // Resume pre-roll (S2: 2-3 drops per resume): the source is ready and paused;
-                    // give the renderers resumePrerollMs before the clock runs again. The page keeps
-                    // hearing "paused" until it does (no buffering flash on a resume).
-                    resumePending = true
-                    Log.i(TAG, "${request?.videoId}: resume pre-roll ${resumePrerollMs} ms (${countersText(p)})")
-                    main.postDelayed(resumeEnd, resumePrerollMs)
+                val resuming = firstFrame && !p.playWhenReady &&
+                    (p.playbackState == Player.STATE_READY || reposition == Reposition.IN_FLIGHT)
+                if (resuming) {
+                    // A resume after a pause (ResumePlan.kt): the old track plays on under the
+                    // guard, or the reposition made it a fresh start. The page keeps hearing
+                    // "paused" through any pre-roll (no buffering flash on a resume).
+                    main.removeCallbacks(repositionTimer)
+                    applyResume(p, ResumePlanner.onPlay(resumeConfig, reposition), "paused ${SystemClock.elapsedRealtime() - pausedAt} ms")
                 } else {
-                    if (resuming) resumeStartedAt = SystemClock.elapsedRealtime()
                     startPlayback(p)
                 }
             }
@@ -1039,9 +1273,22 @@ class NativePlayerHost(
                 // A start held for a mode switch is dropped too; the wait itself runs on (capped),
                 // so a play soon after still does not start into the HDMI re-sync.
                 modeHeldStart = false
+                playAfterReposition = false
+                main.removeCallbacks(pictureWatch)
+                val wasPlaying = p.playWhenReady
                 p.pause()
+                if (wasPlaying) {
+                    pausedAt = SystemClock.elapsedRealtime()
+                    if (reposition == Reposition.NONE) {
+                        ResumePlanner.repositionDelay(resumeConfig, desiredRate)?.let { main.postDelayed(repositionTimer, it) }
+                    }
+                }
             }
-            "seek" -> if (value.isFinite()) p.seekTo((value * 1000).toLong().coerceAtLeast(0))
+            "seek" -> if (value.isFinite()) {
+                // A seek is a fresh start of its own (the audio output is flushed).
+                cancelReposition()
+                p.seekTo((value * 1000).toLong().coerceAtLeast(0))
+            }
             "stop" -> {
                 releasePlayer()
                 request = null
@@ -1052,7 +1299,20 @@ class NativePlayerHost(
     }
 
     private fun applyVolume() {
-        player?.volume = if (muted) 0f else volume
+        player?.volume = if (muted || debugForceMute()) 0f else volume
+    }
+
+    /**
+     * Debug builds only: `adb shell setprop debug.vistaks.mute 1` keeps the native player silent
+     * whatever the page asks (device runs drive the real UI, which starts every video unmuted).
+     */
+    private fun debugForceMute(): Boolean {
+        if (!BuildConfig.DEBUG) return false
+        return try {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, "debug.vistaks.mute") == "1"
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**
@@ -1069,6 +1329,7 @@ class NativePlayerHost(
         main.removeCallbacks(prerollEnd)
         resumePending = false
         main.removeCallbacks(resumeEnd)
+        cancelReposition()
         main.removeCallbacks(firstFrameTimeout)
         main.removeCallbacks(extractionTimeout)
         main.removeCallbacks(handoverTimeout)
@@ -1088,6 +1349,7 @@ class NativePlayerHost(
             p.removeListener(listener)
             p.removeAnalyticsListener(analytics)
             surface?.let { p.clearVideoSurfaceView(it) }
+            videoLayerSurface?.let { p.clearVideoSurface(it) }
             p.release()
             player = null
             bandwidthMeter = null
@@ -1141,7 +1403,8 @@ class NativePlayerHost(
     private fun syncPlayState() {
         val p = player ?: return
         when (p.playbackState) {
-            Player.STATE_BUFFERING -> emitState(STATE_BUFFERING)
+            // A reposition while paused is the host's own business: the page keeps "paused".
+            Player.STATE_BUFFERING -> emitState(if (reposition == Reposition.IN_FLIGHT && !p.playWhenReady && !playAfterReposition) STATE_PAUSED else STATE_BUFFERING)
             Player.STATE_ENDED -> {
                 emitState(STATE_ENDED)
                 stopTicker()
@@ -1150,7 +1413,7 @@ class NativePlayerHost(
             Player.STATE_READY -> when {
                 !firstFrame -> {}
                 // Pre-rolling: still "buffering" to the page, never a pause it did not ask for.
-                prerollPending || modeHeldStart -> emitState(STATE_BUFFERING)
+                prerollPending || modeHeldStart || playAfterReposition -> emitState(STATE_BUFFERING)
                 else -> emitState(if (p.playWhenReady) STATE_PLAYING else STATE_PAUSED)
             }
             else -> {}
@@ -1162,7 +1425,16 @@ class NativePlayerHost(
     }
 
     private val listener = object : Player.Listener {
-        override fun onPlaybackStateChanged(playbackState: Int) = syncPlayState()
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (reposition == Reposition.IN_FLIGHT) {
+                if (playbackState == Player.STATE_BUFFERING) repositionSawBuffering = true
+                if (playbackState == Player.STATE_READY && repositionSawBuffering) {
+                    repositionDone("seek ready")
+                    return
+                }
+            }
+            syncPlayState()
+        }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) = syncPlayState()
 
@@ -1192,6 +1464,8 @@ class NativePlayerHost(
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             if (videoSize.width > 0 && videoSize.height > 0) {
+                bufferWidth = videoSize.width
+                bufferHeight = videoSize.height
                 videoWidth = videoSize.width
                 videoHeight = (videoSize.height / videoSize.pixelWidthHeightRatio.coerceAtLeast(0.01f)).toInt()
                 layoutSurface("video size ${videoSize.width}x${videoSize.height}")
@@ -1436,10 +1710,20 @@ class NativePlayerHost(
         val lp = (view.layoutParams as? FrameLayout.LayoutParams)
             ?: FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         lp.gravity = Gravity.TOP or Gravity.START
-        lp.leftMargin = Math.round(px).toInt()
-        lp.topMargin = Math.round(py).toInt()
-        lp.width = Math.round(pw).toInt().coerceAtLeast(1)
-        lp.height = Math.round(ph).toInt().coerceAtLeast(1)
+        if (videoLayerWanted) {
+            // The SurfaceView is only the parent: the whole root, never past the screen; the
+            // picture's own layer is placed in whole pixels inside it.
+            lp.leftMargin = 0
+            lp.topMargin = 0
+            lp.width = cw
+            lp.height = ch
+            placeVideoLayer(px, py, pw, ph, cw, ch, density)
+        } else {
+            lp.leftMargin = Math.round(px).toInt()
+            lp.topMargin = Math.round(py).toInt()
+            lp.width = Math.round(pw).toInt().coerceAtLeast(1)
+            lp.height = Math.round(ph).toInt().coerceAtLeast(1)
+        }
         // An exact size is measured EXACTLY by FrameLayout even past root's edges (fill): root clips.
         lp.rightMargin = 0
         lp.bottomMargin = 0
@@ -1471,6 +1755,186 @@ class NativePlayerHost(
         )
     }
 
+    /** The player draws into the picture's own layer when there is one, else into the SurfaceView. */
+    private fun attachVideoOutput(p: ExoPlayer, view: SurfaceView) {
+        val layerSurface = videoLayerSurface
+        if (videoLayerWanted && layerSurface != null) {
+            p.setVideoSurface(layerSurface)
+        } else if (videoLayerWanted) {
+            // The SurfaceView's surface is not there yet: surfaceCreated -> createVideoLayer attaches.
+            // Should that not come, try once more and then let the SurfaceView carry the picture.
+            Log.i(TAG, "video layer: waiting for the SurfaceView's surface")
+            main.postDelayed({
+                if (player !== p || videoLayerSurface != null) return@postDelayed
+                createVideoLayer()
+                if (videoLayerSurface == null && player === p) {
+                    Log.w(TAG, "video layer: none 500 ms after the source; the SurfaceView carries the picture")
+                    videoLayerWanted = false
+                    layoutSurface("video layer fallback")
+                    p.setVideoSurfaceView(view)
+                }
+            }, 500)
+        } else {
+            p.setVideoSurfaceView(view)
+        }
+    }
+
+    /** Main thread, on surfaceCreated (or a debug switch): the child layer and its Surface. */
+    private fun createVideoLayer() {
+        val view = surface
+        if (!videoLayerWanted || Build.VERSION.SDK_INT < 29 || videoLayer != null || view == null || !view.holder.surface.isValid) {
+            Log.i(TAG, "video layer: not created now (wanted=$videoLayerWanted, exists=${videoLayer != null}, surface valid=${view?.holder?.surface?.isValid})")
+            return
+        }
+        try {
+            val layer = SurfaceControl.Builder()
+                .setName("Vistaks video")
+                .setParent(view.surfaceControl)
+                .setBufferSize(bufferWidth.coerceAtLeast(2), bufferHeight.coerceAtLeast(2))
+                .setOpaque(true)
+                .build()
+            videoLayer = layer
+            videoLayerSurface = Surface(layer)
+            lastPlacement = null
+            layerGpu = false
+            SurfaceControl.Transaction().setVisibility(layer, true).setLayer(layer, 0).apply()
+            Log.i(TAG, "video layer created (${bufferWidth}x$bufferHeight)")
+            layoutSurface("video layer created")
+            val p = player
+            if (p != null) {
+                surface?.let { p.clearVideoSurfaceView(it) }
+                p.setVideoSurface(videoLayerSurface)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "video layer: not available (${e.message}); the SurfaceView carries the picture")
+            releaseVideoLayer()
+            videoLayerWanted = false
+            player?.let { p -> surface?.let { p.setVideoSurfaceView(it) } }
+            layoutSurface("video layer unavailable")
+        }
+    }
+
+    private fun releaseVideoLayer() {
+        val layerSurface = videoLayerSurface
+        val layer = videoLayer
+        videoLayerSurface = null
+        videoLayer = null
+        lastPlacement = null
+        if (layerSurface != null) player?.clearVideoSurface(layerSurface)
+        if (layer != null && Build.VERSION.SDK_INT >= 29) {
+            try {
+                SurfaceControl.Transaction().reparent(layer, null).apply()
+            } catch (_: Exception) {}
+            layer.release()
+        }
+        layerSurface?.release()
+    }
+
+    /** The GPU for this placement: the composer's own rule, or a debug A/B's. */
+    private fun wantsGpu(placement: VideoGeometry.Placement): Boolean =
+        gpuForce ?: (tegraComposer && VideoGeometry.needsGpu(placement))
+
+    /**
+     * Asks SurfaceFlinger to compose the layer on the GPU (a corner radius: the hardware composer
+     * cannot round a layer, so SurfaceFlinger composes it itself; 0.01 px rounds nothing visible),
+     * or gives it back to the overlay (radius 0). SurfaceControl.Transaction.setCornerRadius is a
+     * hidden API, called by reflection. False when the call is not there or fails.
+     */
+    private fun setLayerGpu(t: SurfaceControl.Transaction, layer: SurfaceControl, on: Boolean): Boolean {
+        val method = cornerRadiusMethod ?: return false
+        return try {
+            method.invoke(t, layer, if (on) gpuRadius else 0f)
+            true
+        } catch (e: Throwable) {
+            Log.w(TAG, "GPU composition: setCornerRadius failed (${e.javaClass.simpleName} ${e.message})")
+            false
+        }
+    }
+
+    private val cornerRadiusMethod: java.lang.reflect.Method? by lazy {
+        try {
+            SurfaceControl.Transaction::class.java.getMethod("setCornerRadius", SurfaceControl::class.java, Float::class.javaPrimitiveType)
+        } catch (e: Throwable) {
+            Log.w(TAG, "GPU composition: no setCornerRadius (${e.javaClass.simpleName}); scaled crops with an offset are contained")
+            null
+        }
+    }
+
+    /** The picture's layer: an integer source crop of the buffer onto the visible box, inside root. */
+    private fun placeVideoLayer(px: Double, py: Double, pw: Double, ph: Double, cw: Int, ch: Int, density: Double) {
+        val layer = videoLayer ?: return
+        if (Build.VERSION.SDK_INT < 29) return
+        fun placeIn(x: Double, y: Double, w: Double, h: Double, onGpu: Boolean = false) = VideoGeometry.place(
+            x, y, w, h, cw, ch, bufferWidth, bufferHeight,
+            displayScale = density, paddedLeft = decoderPaddedLeft, paddedTop = decoderPaddedTop,
+            onGpu = onGpu, insetOverride = edgeInsetOverride,
+        )
+        var placement = placeIn(px, py, pw, ph)
+        var gpu = placement != null && wantsGpu(placement)
+        // On the GPU the crop reaches the buffer's right and bottom edges (VideoGeometry.place onGpu).
+        if (gpu && !gpuUnavailable) placement = placeIn(px, py, pw, ph, onGpu = true)
+        var contained = false
+        if (gpu && gpuUnavailable) {
+            // No GPU composition on this device: the whole picture contained (bars), never the noise.
+            val box = VideoGeometry.containBox(cw, ch, bufferWidth, bufferHeight)
+            placement = placeIn(box[0], box[1], box[2], box[3])
+            gpu = false
+            contained = true
+        }
+        if (placement == lastPlacement && gpu == layerGpu) return
+        lastPlacement = placement
+        val t = SurfaceControl.Transaction()
+        if (placement == null) {
+            t.setVisibility(layer, false).apply()
+            return
+        }
+        if (gpu != layerGpu) {
+            if (setLayerGpu(t, layer, gpu)) {
+                layerGpu = gpu
+            } else if (gpu) {
+                gpuUnavailable = true
+                lastPlacement = null
+                Log.w(TAG, "GPU composition unavailable: contained instead of a scaled offset crop")
+                placeVideoLayer(px, py, pw, ph, cw, ch, density)
+                return
+            }
+        }
+        val s = placement.source
+        val d = placement.destination
+        t.setBufferSize(layer, bufferWidth, bufferHeight)
+            .setGeometry(layer, android.graphics.Rect(s.left, s.top, s.right, s.bottom), android.graphics.Rect(d.left, d.top, d.right, d.bottom), Surface.ROTATION_0)
+            .setVisibility(layer, true)
+            .apply()
+        Log.i(TAG, "video layer: source ${s.left},${s.top}-${s.right},${s.bottom} of ${bufferWidth}x$bufferHeight -> ${d.left},${d.top}-${d.right},${d.bottom} (root ${cw}x$ch, box ${"%.1f".format(px)},${"%.1f".format(py)} ${"%.1f".format(pw)}x${"%.1f".format(ph)}) composition ${if (layerGpu) "GPU" else "overlay"}${if (contained) " (contained: no GPU composition)" else ""}")
+    }
+
+    /**
+     * Playback thread: a video decoder's output format (ResumeClockRenderersFactory). Logs the
+     * buffer it hands the composer (crop, stride, slice height) and, when its crop starts past 0,
+     * keeps the layer's crop away from the padding before the picture too (VideoGeometry).
+     */
+    private fun onDecoderOutputFormat(format: MediaFormat) {
+        fun int(key: String) = if (format.containsKey(key)) format.getInteger(key) else -1
+        val cropLeft = int("crop-left")
+        val cropTop = int("crop-top")
+        val text = "${int("width")}x${int("height")} crop=$cropLeft,$cropTop-${int("crop-right")},${int("crop-bottom")}" +
+            " stride=${int("stride")} slice-height=${int("slice-height")} color-format=${int("color-format")}" +
+            " ${format.getString(MediaFormat.KEY_MIME).orEmpty()}"
+        main.post {
+            if (text != lastOutputFormat) {
+                lastOutputFormat = text
+                Log.i(TAG, "${request?.videoId}: decoder output format $text")
+            }
+            val left = cropLeft > 0
+            val top = cropTop > 0
+            if (left != decoderPaddedLeft || top != decoderPaddedTop) {
+                decoderPaddedLeft = left
+                decoderPaddedTop = top
+                layoutSurface("decoder crop $cropLeft,$cropTop")
+            }
+        }
+    }
+
     // defaultDisplay below API 30; getSupportedHdrTypes is the API 26 way (its API 34 replacement
     // is not on the SHIELD).
     @Suppress("DEPRECATION")
@@ -1481,6 +1945,15 @@ class NativePlayerHost(
 
     private companion object {
         const val TAG = StreamResolver.TAG
+        /** A corner radius nobody sees (display px) that still sends the layer to the GPU. */
+        const val GPU_CORNER_RADIUS = 0.01f
+
+        /** A system property (hidden android.os.SystemProperties, by reflection); "" when unreadable. */
+        fun systemProperty(name: String): String = try {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, name) as? String ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
 
         const val STATE_UNSTARTED = -1
         const val STATE_ENDED = 0
@@ -1496,8 +1969,19 @@ class NativePlayerHost(
         /** A nativeState() read during a hand-over hold keeps it at least this long, once (not a take-over). */
         const val STATE_READ_GRACE_MS = 10_000L
 
-        /** A resume after a pause: the source ready, the clock held this long (S2: 2-3 drops per resume). */
-        const val RESUME_PREROLL_MS = 150L
+        /**
+         * A resume after a pause: the source ready, the clock held this long. 0: the drops it was
+         * meant for were the audio clock's jump, which ResumeClock.kt removes (SHIELD 2026-11-10:
+         * 0 drops at 0 and at 150 ms, and 150 ms left a larger real gap to slew in: 100-130 ms vs 30-60).
+         */
+        const val RESUME_PREROLL_MS = 0L
+
+        /** See ensurePlayer's load control. */
+        const val BACK_BUFFER_MS = 2_000
+        const val FORWARD_BUFFER_MS = 30_000
+
+        /** A reposition that has not reached ready by then is given up on (the resume plays anyway). */
+        const val REPOSITION_TIMEOUT_MS = 8_000L
 
         /** Drops within this long after a resume are logged one by one. */
         const val RESUME_WINDOW_MS = 3_000L

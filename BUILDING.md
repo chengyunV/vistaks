@@ -1,7 +1,7 @@
-# Vistaks TV 0.1.0 — source (sideload flavor)
+# Vistaks TV 0.2.0 — source (sideload flavor)
 
-This archive is the complete source of the Vistaks TV Android shell, version 0.1.0,
-taken from commit 887dabe00da25087f5d0f455e9ec56eb9c5d9015. The sideload APK of this version is licensed under the
+This archive is the complete source of the Vistaks TV Android shell, version 0.2.0,
+taken from commit 71620f66b5d8c39b4ff2799c0843a5dc29ecd83b. The sideload APK of this version is licensed under the
 GNU General Public License, version 3 or (at your option) any later version: see
 tv-android/LICENSE. Third-party components and their licenses are listed in
 tv-android/app/src/sideload/assets/NOTICE.json.
@@ -26,9 +26,9 @@ installed: uninstall it first (pairing is then done again; the library lives in 
 
 ---
 
-# Vistaks TV 0.1.0 原始碼（側載版）
+# Vistaks TV 0.2.0 原始碼（側載版）
 
-這是 Vistaks TV 電視殼 0.1.0 版的完整原始碼（commit 887dabe00da25087f5d0f455e9ec56eb9c5d9015）。側載版 APK 以 GPL-3.0-or-later
+這是 Vistaks TV 電視殼 0.2.0 版的完整原始碼（commit 71620f66b5d8c39b4ff2799c0843a5dc29ecd83b）。側載版 APK 以 GPL-3.0-or-later
 釋出，全文見 tv-android/LICENSE；第三方元件與授權見 tv-android/app/src/sideload/assets/NOTICE.json。
 電視介面（https://vistaks.com/tv）是另外載入的程式，只透過 JS 橋接溝通，不在這個原始碼包裡。
 建置方法同上：JDK 17 以上、Android SDK platform 36，在 tv-android/ 執行 gradlew assembleSideloadDebug。

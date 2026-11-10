@@ -16,7 +16,7 @@
 | 項目 | 值 |
 | --- | --- |
 | applicationId | `com.vistaks.tv` |
-| versionCode / versionName | release：建置當下的 UTC 分鐘數（見「上架 Play 內部測試」），debug：`1` / `0.1.0` |
+| versionCode / versionName | release：建置當下的 UTC 分鐘數（見「上架 Play 內部測試」），debug：`1`；versionName 兩者都是 `app/build.gradle.kts` 的值（目前 `0.2.0`） |
 | minSdk / targetSdk / compileSdk | 26 / 36 / 36 |
 | 工具鏈 | Gradle 8.14.3、AGP 8.11.0、Kotlin 2.0.21、JDK 17+（Android Studio 內建 JBR 21 可用） |
 | 相依 | 共用：`androidx.core:core-ktx`、`androidx.activity:activity-ktx`、`androidx.webkit:webkit`、`desugar_jdk_libs_nio`（無 Compose、無 Leanback 函式庫）；只有 `sideload`：Media3（exoplayer、exoplayer-dash、ui）、OkHttp、NewPipeExtractor（JitPack） |
@@ -115,7 +115,43 @@ Play Console › VistaksTV › 測試 › 內部測試 › 建立新版本 › �
 - 同一分鐘內建置兩次會得到同一個值，Play 會拒收重複的 versionCode：隔一分鐘再建即可。
 - debug 固定 `1`（避免每分鐘讓增量建置失效）。
 - 緊急覆寫（例如電腦時鐘錯了）：`.\gradlew.bat bundlePlayRelease -PvistaksTvVersionCode=<1–2100000000>`，必須大於 Play 上已有的最大值。
-- `versionName` 維持 `0.1.0`（手動在 `app/build.gradle.kts` 改），只給人看。原生殼有變動才需要重傳 AAB；介面更新走網站部署。
+- `versionName` 手動在 `app/build.gradle.kts` 改（目前 `0.2.0`），給人看，也是原始碼包與側載版檔名用的版本。側載版的自動更新只比較 `versionCode`。原生殼有變動才需要重傳 AAB；介面更新走網站部署。
+
+## 自動更新（只有 `sideload` 版）
+
+側載版可以自己更新：App 讀一份清單（JSON），清單上有較新的 `versionCode` 時，網頁在首頁與「設定 › 這台電視」提示；使用者按「更新」後，App 下載 APK、檢查後交給系統安裝程式，由系統畫面確認安裝。`play` 版沒有這個功能（由 Play 更新），沒有安裝權限，也不含更新程式碼。
+
+- **清單網址在建置時注入，不在原始碼裡。** 沒有設定時建出來的 APK 完全沒有更新功能（網頁看不到 `window.VistaksTvUpdate`）；從原始碼自行建置的版本預設就是這樣。release 依序讀：環境變數 `VISTAKS_TV_UPDATE_MANIFEST_URL`、Gradle 屬性 `-PvistaksTvUpdateManifestUrl=…`、不進版控的 `tv-android/update.properties`：
+
+  ```properties
+  manifestUrl=https://<你的下載主機>/<路徑>/sideload.json
+  ```
+
+  debug 版不讀 `update.properties`，只接受 `-PvistaksTvDebugUpdateManifestUrl=…`（或環境變數 `VISTAKS_TV_DEBUG_UPDATE_MANIFEST_URL`），用來對測試清單驗證更新流程。網址必須是 `https://`。
+- **清單格式（schema 1）**：
+
+  ```json
+  { "schema": 1, "versionName": "0.2.1", "versionCode": 451600,
+    "apk": { "url": "https://<同一個主機>/<路徑>/vistaks-tv-0.2.1-451600-sideload.apk", "sha256": "<64 位小寫十六進位>", "sizeBytes": 12345678 },
+    "publishedAt": "2026-11-10T12:00:00Z", "sourceUrl": "https://…/vistaks-tv-src-0.2.1.tar.gz", "notes": "（可省略）" }
+  ```
+
+  APK 必須與清單在同一個 `https://` 主機；不符合格式的清單一律忽略。
+- **何時檢查**：啟動 45 秒後在背景讀一次（失敗不提示），同一次啟動只讀一次；距離上次成功讀取不到 6 小時就沿用上次的結果。debug 版可用 `adb shell am start -n com.vistaks.tv/.MainActivity --ez updateForceCheck true` 立刻檢查。
+- **下載**：只在使用者按「更新」後開始，存在 App 的快取目錄；播放中（網頁持有螢幕常亮租約時）限速 512 KiB/s。先確認剩餘空間（APK 大小加 32 MB）。
+- **安裝前的檢查**：大小與 SHA-256 與清單相同、套件名是 `com.vistaks.tv`、`versionCode` 與清單相同、簽章憑證與已安裝的 App 完全相同。任何一項不符就刪掉檔案、顯示失敗原因，不會交給安裝程式。Android 本身也只允許同一把金鑰簽章、`versionCode` 不更低的 APK 覆蓋安裝。
+- **安裝**：`PackageInstaller` session，系統顯示確認畫面（遙控器可操作）。播放中下載完成時不跳出確認畫面，等使用者按「安裝」。使用者取消後，這次啟動首頁不再提示（設定裡仍可更新）。第一次更新時系統會要求允許這個 App「安裝未知的應用程式」；未允許時 App 開啟系統的設定頁（電視沒有這一頁時直接交給安裝程式詢問）。
+- 覆蓋安裝保留 App 資料：配對與這台電視的設定都還在。
+
+橋接（`window.VistaksTvUpdate`，只在有更新功能的 APK 上存在）：
+
+| 方法 | 回傳 | 說明 |
+| --- | --- | --- |
+| `state()` | JSON 字串 | `{ state, currentVersion, versionName, versionCode, sizeBytes, downloadedBytes, progress, reason, dismissed, waitingForPlayback, throttled, notes }`；`state` 是 `none` / `available` / `downloading` / `ready` / `installing` / `failed` |
+| `start()` | — | `available` / `failed`：下載並安裝；`ready`：安裝；`installing`：重新開啟系統確認畫面 |
+| `dismiss()` | — | 這次啟動首頁不再提示這個版本 |
+
+狀態變化經 `window.VistaksTv.native('update', json)` 通知網頁。`reason` 是 `network`、`space`、`size`、`checksum`、`signature`、`package`、`permission`、`incompatible`、`storage`、`blocked`、`install`、`cancelled` 之一。
 
 ## 指向區網開發伺服器
 
@@ -145,7 +181,7 @@ debug 版可用 Chrome 的 `chrome://inspect` 遠端偵錯 WebView（`setWebCont
 | 方法 | 回傳 | 說明 |
 | --- | --- | --- |
 | `platform()` | `"android-tv"` / `"android"` | `UiModeManager.currentModeType == UI_MODE_TYPE_TELEVISION` 時為 `android-tv` |
-| `appVersion()` | 例如 `"0.1.0"` | `BuildConfig.VERSION_NAME` |
+| `appVersion()` | 例如 `"0.2.0"` | `BuildConfig.VERSION_NAME` |
 | `deviceName()` | 字串 | `Build.MODEL`，去頭尾空白，最多 80 字元 |
 | `exit()` | — | 在主執行緒 `finishAndRemoveTask()` |
 | `keepAwake(on)` | — | `true`＝持有螢幕常亮（`FLAG_KEEP_SCREEN_ON`，只在 activity 位於前景時生效）並把 10 分鐘的租約重新起算；`false`＝立即放開。沒人續租的租約 10 分鐘後自己失效 |

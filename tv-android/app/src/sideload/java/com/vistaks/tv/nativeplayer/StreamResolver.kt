@@ -533,9 +533,9 @@ internal class StreamResolver {
             )
             Codec.H264 -> return false
         }
-        // S4 device run (2026-11-10, SHIELD TV 2017 "darcy", Tegra X1): OMX.Nvidia.vp9.decode declares
+        // S4 device run (2026-11-10, NVIDIA SHIELD TV Pro (2019) "mdarcy", Tegra X1+): OMX.Nvidia.vp9.decode declares
         // VP9Profile0 only, and fed itag 337 (vp09.02, 10-bit) it answers OMX_ErrorFormatNotDetected
-        // (0x80001020): the declaration is truthful, the X1 has no 10-bit VP9. The declared profiles
+        // (0x80001020): the declaration is truthful, this SHIELD decodes no 10-bit VP9. The declared profiles
         // decide; a decoder that lies the other way is caught by the SDR retry in NativePlayerHost.
         return caps.profileLevels.any { it.profile in wanted }
     }

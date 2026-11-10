@@ -43,6 +43,7 @@ import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.vistaks.tv.nativeplayer.NativePlayerHost
+import com.vistaks.tv.update.SelfUpdateHost
 import org.json.JSONObject
 
 /**
@@ -70,6 +71,13 @@ class MainActivity : ComponentActivity() {
      * through the bridge's native* methods (§3); the host tells us when its surface shows (overlay).
      */
     private lateinit var nativePlayer: NativePlayerHost
+
+    /**
+     * The self-update (sideload with a configured manifest only; play's is a no-op whose bridge is
+     * null). Its bridge is `window.VistaksTvUpdate`; its events reach the page as
+     * `window.VistaksTv.native('update', json)` (ADR-0100 §3, ADR-0094 amendment 2026-11-10).
+     */
+    private lateinit var selfUpdate: SelfUpdateHost
 
     private var webViewDestroyed = false
 
@@ -105,7 +113,21 @@ class MainActivity : ComponentActivity() {
     private var keepAwake = false
     private val keepAwakeExpiry = Runnable {
         keepAwake = false
+        applyPlaybackActive()
         applyKeepAwake()
+    }
+
+    /**
+     * The native player plays (its own `state` events: 1 playing, 3 buffering). The self-update
+     * reads "something plays" from this or the page's keep-awake lease: the 2026-11-10 device run
+     * found the page's single-video player never takes the lease, so the lease alone let the
+     * installer's dialog pop over a native 4K video.
+     */
+    private var nativePlaying = false
+
+    /** Something plays: the update's download slows down and its installer waits (ready). */
+    private fun applyPlaybackActive() {
+        if (this::selfUpdate.isInitialized) selfUpdate.setPlaybackActive(keepAwake || nativePlaying)
     }
 
     private val chromeClient = object : WebChromeClient() {
@@ -231,6 +253,7 @@ class MainActivity : ComponentActivity() {
             window.setFormat(PixelFormat.TRANSLUCENT)
         }
         nativePlayer.attach(findViewById(R.id.root))
+        selfUpdate = SelfUpdateHost(this) { event, json -> sendNative(event, json) }
 
         errorView = findViewById(R.id.error_view)
         retryButton = findViewById(R.id.retry_button)
@@ -247,6 +270,8 @@ class MainActivity : ComponentActivity() {
         launchReason = LAUNCH
         webView.loadUrl(BuildConfig.TV_URL)
         webView.requestFocus()
+        // Debug only: an update test on a device checks now (am start ... --ez updateForceCheck true).
+        selfUpdate.onCreate(forceCheck = BuildConfig.DEBUG && intent.getBooleanExtra(EXTRA_UPDATE_FORCE_CHECK, false))
     }
 
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
@@ -275,6 +300,8 @@ class MainActivity : ComponentActivity() {
         view.webViewClient = viewClient
         view.webChromeClient = chromeClient
         view.addJavascriptInterface(TvHostBridge(), "VistaksTvHost")
+        // Only a shell that can update itself has this object; the page shows its update entry by it.
+        selfUpdate.bridge()?.let { view.addJavascriptInterface(it, UPDATE_BRIDGE) }
     }
 
     private fun destroyWebView() {
@@ -282,6 +309,7 @@ class MainActivity : ComponentActivity() {
         webViewDestroyed = true
         val view = webView
         view.removeJavascriptInterface("VistaksTvHost")
+        view.removeJavascriptInterface(UPDATE_BRIDGE)
         (view.parent as? ViewGroup)?.removeView(view)
         view.destroy()
     }
@@ -298,6 +326,9 @@ class MainActivity : ComponentActivity() {
         // The page that held the screen is gone; the new one takes a lease again when it plays.
         mainHandler.removeCallbacks(keepAwakeExpiry)
         keepAwake = false
+        // The host holds the native player paused for the new page (onWebViewRebuilt below).
+        nativePlaying = false
+        applyPlaybackActive()
         applyKeepAwake()
         val fresh = WebView(this).apply {
             id = R.id.web_view
@@ -360,6 +391,7 @@ class MainActivity : ComponentActivity() {
         if (!webViewDestroyed) webView.onResume()
         hideSystemBars()
         sendLifecycle("resume")
+        selfUpdate.onResume()
     }
 
     override fun onPause() {
@@ -391,6 +423,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
         nativePlayer.release()
+        selfUpdate.release()
         destroyWebView()
         super.onDestroy()
     }
@@ -452,6 +485,7 @@ class MainActivity : ComponentActivity() {
 
     /** `window.VistaksTv.native(event, json)` (ADR-0100 §3); main thread. Quiet when the page has no such hook. */
     private fun sendNative(event: String, json: String) {
+        if (event == "state") noteNativeState(json)
         // The host is built (and could emit) before installWebView runs.
         if (!this::webView.isInitialized || webViewDestroyed) return
         webView.evaluateJavascript(
@@ -522,9 +556,19 @@ class MainActivity : ComponentActivity() {
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
+    /** The native player's `state` event (main thread): playing or buffering counts as playing. */
+    private fun noteNativeState(json: String) {
+        val state = try { JSONObject(json).optInt("state", Int.MIN_VALUE) } catch (_: Exception) { Int.MIN_VALUE }
+        if (state == Int.MIN_VALUE) return
+        nativePlaying = state == 1 || state == 3
+        applyPlaybackActive()
+    }
+
     private fun setKeepAwake(on: Boolean) {
         mainHandler.removeCallbacks(keepAwakeExpiry)
         keepAwake = on
+        // The lease means something plays (as does the native player's own state).
+        applyPlaybackActive()
         // A lease nobody renews (the page died, or forgot) ends by itself.
         if (on) mainHandler.postDelayed(keepAwakeExpiry, KEEP_AWAKE_LEASE_MS)
         applyKeepAwake()
@@ -658,7 +702,11 @@ class MainActivity : ComponentActivity() {
 
         /** Player, decoder and surface released; the WebView opaque again. */
         @JavascriptInterface
-        fun nativeRelease() = nativePlayer.release()
+        fun nativeRelease() {
+            nativePlayer.release()
+            // A release sends no state: nothing plays from here.
+            runOnUiThread { nativePlaying = false; applyPlaybackActive() }
+        }
 
         /**
          * ADR-0100 §6 / S5: the APK's license notice, `{ license, sourceUrl, components: [{ name,
@@ -685,6 +733,10 @@ class MainActivity : ComponentActivity() {
 
         /** The native player's logcat tag (StreamResolver.TAG in the sideload flavor). */
         const val NATIVE_TAG = "VistaksNative"
+
+        /** The self-update's bridge object (sideload with a manifest only). */
+        const val UPDATE_BRIDGE = "VistaksTvUpdate"
+        const val EXTRA_UPDATE_FORCE_CHECK = "updateForceCheck"
 
         const val LAUNCH = "launch"
         const val RENDER_GONE = "render-gone"

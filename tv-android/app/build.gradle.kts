@@ -1,3 +1,4 @@
+import com.android.build.api.variant.BuildConfigField
 import java.time.Duration
 import java.time.Instant
 import java.util.Properties
@@ -92,6 +93,48 @@ val uploadKeyProblems: List<String> = buildList {
 }
 val hasUploadKey = uploadKeyProblems.isEmpty()
 
+// ---------------------------------------------------------------------------
+// Self-update channel (sideload flavor only).
+//
+// The updater checks one manifest URL. It is never part of the source: a build without one has no
+// updater at all (the bridge is not even registered), which is what a build from the published
+// source gets. Release builds read, in this order:
+//   VISTAKS_TV_UPDATE_MANIFEST_URL (environment) / -PvistaksTvUpdateManifestUrl / the gitignored
+//   tv-android/update.properties (manifestUrl=https://...).
+// Debug builds never read update.properties: they get a manifest only from
+//   -PvistaksTvDebugUpdateManifestUrl / VISTAKS_TV_DEBUG_UPDATE_MANIFEST_URL
+// (an update test against a test manifest), so a debug build never meets the release channel.
+// ---------------------------------------------------------------------------
+val updatePropertiesFile: File = rootProject.file("update.properties")
+val updateProperties = Properties().apply {
+    if (updatePropertiesFile.isFile) {
+        updatePropertiesFile.inputStream().use { load(it) }
+    }
+}
+
+fun checkedManifestUrl(raw: String?, origin: String): String {
+    val value = raw?.trim().orEmpty()
+    if (value.isEmpty()) return ""
+    if (!Regex("^https://[A-Za-z0-9.-]+(?::\\d+)?/[A-Za-z0-9._~/-]+\\.json$").matches(value)) {
+        throw GradleException("$origin must be an https:// URL of a .json manifest (got '$value').")
+    }
+    return value
+}
+
+val releaseUpdateManifestUrl: String = run {
+    System.getenv("VISTAKS_TV_UPDATE_MANIFEST_URL")?.takeIf { it.isNotBlank() }
+        ?.let { checkedManifestUrl(it, "VISTAKS_TV_UPDATE_MANIFEST_URL") }
+        ?: (project.findProperty("vistaksTvUpdateManifestUrl") as String?)?.takeIf { it.isNotBlank() }
+            ?.let { checkedManifestUrl(it, "-PvistaksTvUpdateManifestUrl") }
+        ?: checkedManifestUrl(updateProperties.getProperty("manifestUrl"), "update.properties manifestUrl")
+}
+
+val debugUpdateManifestUrl: String = run {
+    (project.findProperty("vistaksTvDebugUpdateManifestUrl") as String?)?.takeIf { it.isNotBlank() }
+        ?.let { checkedManifestUrl(it, "-PvistaksTvDebugUpdateManifestUrl") }
+        ?: checkedManifestUrl(System.getenv("VISTAKS_TV_DEBUG_UPDATE_MANIFEST_URL"), "VISTAKS_TV_DEBUG_UPDATE_MANIFEST_URL")
+}
+
 android {
     namespace = "com.vistaks.tv"
     compileSdk = 36
@@ -102,7 +145,7 @@ android {
         targetSdk = 36
         // Debug default; release variants get releaseVersionCode (see androidComponents below).
         versionCode = versionCodeOverride ?: 1
-        versionName = "0.1.0"
+        versionName = "0.2.0"
     }
 
     signingConfigs {
@@ -164,6 +207,15 @@ androidComponents {
     onVariants(selector().withBuildType("release")) { variant ->
         variant.outputs.forEach { output -> output.versionCode.set(releaseVersionCode) }
     }
+    // The self-update manifest (see above): sideload only. The play flavor has no such field, no
+    // updater classes and no install permission (scripts/test_tv_self_update_contract.mjs).
+    onVariants(selector().withFlavor("distribution" to "sideload")) { variant ->
+        val url = if (variant.buildType == "release") releaseUpdateManifestUrl else debugUpdateManifestUrl
+        variant.buildConfigFields?.put(
+            "UPDATE_MANIFEST_URL",
+            BuildConfigField("String", javaStringLiteral(url), "self-update manifest; empty = no updater"),
+        )
+    }
 }
 
 // Fail fast (before any task runs) when a release bundle is requested without a usable upload key.
@@ -203,6 +255,9 @@ kotlin {
 dependencies {
     // JVM unit tests (tv-android/app/src/testSideload: the HDR track supplement, TV-S4H).
     testImplementation("junit:junit:4.13.2")
+    // The real org.json for JVM unit tests (android.jar's copy is a stub that throws): the
+    // self-update manifest parser and state JSON (testSideload/.../update).
+    testImplementation("org.json:json:20240303")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("androidx.webkit:webkit:1.14.0")
